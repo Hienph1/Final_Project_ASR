@@ -1,16 +1,22 @@
+#%%
 import os
+import random
 import numpy as np
 import time
-import utils
-import metrics
+from modules.augment_data import *
+from modules import utils
+from modules import metrics
 import matplotlib.pyplot as plt
-from mobilenetv2 import _inverted_residual_block
+from modules._ghostnet import GhostBottleNeck
+from modules.mbconv_block import mbconv_block
 
-from tensorflow.keras import layers
-from tensorflow.keras import models
-import tensorflow.keras.backend as K
+from tensorflow.keras import layers # type: ignore
+from tensorflow.keras import models # type: ignore
+from tensorflow.keras.regularizers import l2 # type: ignore
 from sklearn.metrics import confusion_matrix
-
+import tensorflow as tf
+from modules.YOHO import YOHO
+#%%
 def load_data(feat_folder, is_mono, fold):
    """Load training and testing data for the given fold."""
    feat_file = os.path.join(feat_folder, f'mbe_{"mon" if is_mono else "bin"}_fold{fold}.npz')
@@ -18,33 +24,43 @@ def load_data(feat_folder, is_mono, fold):
    X_train, Y_train, X_test, Y_test = data['arr_0'], data['arr_1'], data['arr_2'], data['arr_3']
    return X_train, Y_train, X_test, Y_test
 
-def build_model(input_shape, output_shape, cnn_filters, cnn_pool_size, rnn_units, fc_units, dropout_rate):
-   """Build the CRNN model."""
-   inputs = layers.Input(shape=input_shape)
-   x = inputs
+def build_model(input_shape, output_shape, cnn_filters, nb_strides, rnn_units, fc_units, dropout_rate):
+   input_layer = layers.Input(shape=input_shape)
 
-   # Convolutional layers
-   for pool_size in cnn_pool_size:
-      x = layers.Conv2D(filters=cnn_filters, kernel_size=(3, 3), padding='same')(x)
-      x = layers.BatchNormalization(axis=1)(x)
-      x = layers.Activation('relu')(x)
-      x = layers.Conv2D(filters=cnn_filters/2, kernel_size=(3, 3), padding='same')(x)
-      x = layers.BatchNormalization(axis=1)(x)
-      x = layers.Activation('relu')(x)
-      x = layers.MaxPooling2D(pool_size=(1, pool_size))(x)
-      x = layers.Dropout(dropout_rate)(x)
-   
-   x = _inverted_residual_block(x, 64, (1,3), 2, alpha=1.0, strides=1, n=1)
-   x = _inverted_residual_block(x, 96, (1,3), 2, alpha=1.0, strides=1, n=2)
-   x = _inverted_residual_block(x, 128, (1,3), 3, alpha=1.0, strides=1, n=3)
-   x = _inverted_residual_block(x, 128, (1,3), 4, alpha=1.0, strides=1, n=6)
-   x = _inverted_residual_block(x, 256, (1,3), 4, alpha=1.0, strides=1, n=6)
-   
-   # Reshape for RNN layers
-   x = layers.Permute((2, 1, 3))(x)
+   spec_1 = layers.Lambda(lambda x: x[:,0,:,:])(input_layer)
+   spec_2 = layers.Lambda(lambda x: x[:,1,:,:])(input_layer)
+
+   spec_1 = layers.Reshape((256,40,1))(spec_1)
+   spec_2 = layers.Reshape((256,40,1))(spec_2)
+
+   yoho = YOHO(cnn_filters, nb_strides)
+
+   feat_1 = yoho(spec_1)
+   # feat_1 = GhostBottleNeck(feat_1, 128, 3)
+   # feat_1 = mbconv_block(feat_1, filters=64, kernel_size=3, strides=1, expand_ratio=3, se_ratio=0.2, drop_rate=0.4)
+   feat_1 = mbconv_block(feat_1, filters=128, kernel_size=3, strides=2, expand_ratio=4, se_ratio=0.2, drop_rate=0.4)
+   # feat_1 = mbconv_block(feat_1, filters=256, kernel_size=3, strides=1, expand_ratio=3, se_ratio=0.2, drop_rate=0.4)
+   # feat_1 = layers.Conv2D(256, kernel_size=(4,1), strides=(4,1), padding='same')(feat_1)
+   # feat_1 = layers.BatchNormalization()(feat_1)
+   # feat_1 = layers.Activation('swish')(feat_1)
+   # feat_1 = layers.MaxPooling2D(pool_size=(4,2))(feat_1)
+
+   feat_2 = yoho(spec_2)
+   # feat_2 = GhostBottleNeck(feat_2, 128, 3)
+   # feat_2 = mbconv_block(feat_2, filters=64, kernel_size=3, strides=1, expand_ratio=3, se_ratio=0.2, drop_rate=0.4)
+   feat_2 = mbconv_block(feat_2, filters=128, kernel_size=3, strides=2, expand_ratio=4, se_ratio=0.2, drop_rate=0.4)
+   # feat_2 = mbconv_block(feat_2, filters=256, kernel_size=3, strides=1, expand_ratio=3, se_ratio=0.2, drop_rate=0.4)
+   # feat_2 = layers.Conv2D(256, kernel_size=(4,1), strides=(4,1), padding='same')(feat_2)
+   # feat_2 = layers.BatchNormalization()(feat_2)
+   # feat_2 = layers.Activation('swish')(feat_2)
+   # feat_2 = layers.MaxPooling2D(pool_size=(4,2))(feat_2)
+
+   # concatenated_features = layers.Concatenate(axis=1)([feat_1, feat_2])
+   concatenated_features = layers.Concatenate()([feat_1, feat_2])
+
+   x = layers.Permute((2,1,3))(concatenated_features)
    x = layers.Reshape((input_shape[1], -1))(x)
 
-   # RNN layers
    for units in rnn_units:
       x = layers.Bidirectional(layers.GRU(units, activation='tanh', dropout=dropout_rate, recurrent_dropout=dropout_rate, return_sequences=True), merge_mode='mul')(x)
    
@@ -53,15 +69,25 @@ def build_model(input_shape, output_shape, cnn_filters, cnn_pool_size, rnn_units
       x = layers.TimeDistributed(layers.Dense(units))(x)
       x = layers.Dropout(dropout_rate)(x)
    
-   # Output layer
    outputs = layers.TimeDistributed(layers.Dense(output_shape[-1]))(x)
    outputs = layers.Activation('sigmoid', name='strong_out')(outputs)
    
-   model = models.Model(inputs=inputs, outputs=outputs)
+   model = models.Model(inputs=input_layer, outputs=outputs)
    model.compile(optimizer='adam', loss='binary_crossentropy')
    model.summary()
    return model
-
+#%%
+# cnn_filters = [32, 64, 64, 128, 128]
+# nb_strides = [1, 2, 1, 2, 1]
+# model = build_model(input_shape=(2,256,40),
+#                     output_shape=(256,6),
+#                     cnn_filters=[32, 64, 128, 128],
+#                     nb_strides=[1, 2, 2, 1],
+#                     rnn_units=[32,32],
+#                     fc_units=[32],
+#                     dropout_rate=0.5)
+# model.summary()
+#%%
 def plot_training_curves(epochs, train_loss, val_loss, f1_scores, error_rates, fig_name):
    """Plot training and validation loss, and F1 and error rates."""
    plt.figure()
@@ -91,14 +117,56 @@ def preprocess_data(X, Y, X_test, Y_test, seq_len, nb_ch):
 
    X = utils.split_multi_channels(X, nb_ch)
    X_test = utils.split_multi_channels(X_test, nb_ch)
+      
    return X, Y, X_test, Y_test
+
+def augmentation(X_train, Y_train):
+   X_augmented = []
+   Y_augmented = []
+
+   for feat, label in zip(X_train, Y_train):
+      noise = np.copy(feat)
+      noise[0] = noise_injection(noise[0], noise_factor=0.1)
+      noise[1] = noise_injection(noise[1], noise_factor=0.1)
+      X_augmented.append(noise)
+      Y_augmented.append(label)
+   
+   for feat, label in zip(X_train, Y_train):
+      time = np.copy(feat)
+      time[0] = time_masking(time[0], mask_percentage=0.02)
+      time[1] = time_masking(time[1], mask_percentage=0.02)
+      X_augmented.append(time)
+      Y_augmented.append(label)
+
+   for feat, label in zip(X_train, Y_train):
+      freq = np.copy(feat)
+      freq[0] = frequency_masking(freq[0], mask_percentage=0.02)
+      freq[1] = frequency_masking(freq[1], mask_percentage=0.02)
+      X_augmented.append(freq)
+      Y_augmented.append(label)
+
+   for feat, label in zip(X_train, Y_train):
+      augment = np.copy(feat)
+      augment[0] = spec_augment(augment[0])
+      augment[1] = spec_augment(augment[1])
+      X_augmented.append(augment)
+      Y_augmented.append(label)
+
+   for feat, label in zip(X_train, Y_train):
+      X_augmented.append(feat)
+      Y_augmented.append(label)
+
+   random.shuffle(np.array(X_augmented))
+   random.shuffle(np.array(Y_augmented))
+
+   return np.array(X_augmented), np.array(Y_augmented)
 
 is_mono = False
 feat_folder = 'data/feat/'
 fig_name = f'{"mon" if is_mono else "bin"}_{time.strftime("%Y_%m_%d_%H_%M_%S")}'
 
 nb_ch = 1 if is_mono else 2
-batch_size = 256
+batch_size = 300
 seq_len = 256
 nb_epoch = 500
 # patience = int(0.25 * nb_epoch)
@@ -115,22 +183,13 @@ models_dir = 'models/'
 utils.create_folder(models_dir)
 
 # Model parameters
-cnn_filters = 128
-cnn_pool_size = [5, 2, 2, 2]
-rnn_units = [64, 32, 16, 16]
-fc_units = [64]
-dropout_rate = 0.45
-#######------------------------
-# nb_cnn2d_filt=64
-# pool_size=[5, 2, 2, 2]
-# rnn_size=[128, 128]
-# fnn_size=[128]
-# dropout_rate = 0.5
+cnn_filters = [32, 64, 128, 128, 128]
+nb_strides = [1, 2, 2, 1, 1]
+rnn_units = [32, 32]
+fc_units = [32]
+dropout_rate = 0.5
 
-# print(f'MODEL PARAMETERS:\n cnn_filters: {cnn_filters}, cnn_pool_size: {cnn_pool_size}, rnn_units: {rnn_units}, fc_units: {fc_units}, dropout_rate: {dropout_rate}')
-
-X_train, Y_train, X_test, Y_test = load_data(feat_folder, is_mono, 1)
-X_train, Y_train, X_test, Y_test = preprocess_data(X_train, Y_train, X_test, Y_test, seq_len, nb_ch)
+print(f'MODEL PARAMETERS:\n cnn_filters: {cnn_filters}, nb_strides: {nb_strides}, rnn_units: {rnn_units}, fc_units: {fc_units}, dropout_rate: {dropout_rate}')
 
 avg_er = []
 avg_f1 = []
@@ -142,9 +201,9 @@ for fold in [1, 2, 3, 4]:
 
    X_train, Y_train, X_test, Y_test = load_data(feat_folder, is_mono, fold)
    X_train, Y_train, X_test, Y_test = preprocess_data(X_train, Y_train, X_test, Y_test, seq_len, nb_ch)
+   X_train, Y_train = augmentation(X_train, Y_train)
 
-   model = build_model(X_train.shape[1:], Y_train.shape[2:], cnn_filters, cnn_pool_size, rnn_units, fc_units, dropout_rate)
-   # model = get_sedtcn_model(X_train.shape[1:], Y_train.shape[2:], dropout_rate, nb_cnn2d_filt, pool_size, fnn_size)
+   model = build_model(X_train.shape[1:], Y_train.shape[2:], cnn_filters, nb_strides, rnn_units, fc_units, dropout_rate)
 
    best_epoch, patience_counter, best_er, f1_for_best_er, best_conf_mat = 0, 0, float('inf'), None, None
    train_loss, val_loss, f1_scores, error_rates = [], [], [], []
